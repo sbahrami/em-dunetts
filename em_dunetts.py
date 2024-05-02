@@ -2,24 +2,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def perturb_last_dim(arr, delta):
-    def recursive_iteration(current_index, dimension_indices, delta):
-        if current_index == len(arr.shape) - 1:
-            # Reached the last dimension
-            idxs  = [tuple(dimension_indices + [i]) for i in range(arr.shape[-1])]
-            r_values = [np.random.uniform(0, delta) for i in range(arr.shape[-1])]
-            for i in range(arr.shape[-1]):
-                idx = tuple(dimension_indices + [i])
-                arr[idx] = (arr[idx] + r_values[i]) / (1 + sum(r_values))
-            return arr
-        else:
-            # Iterate over the current dimension
-            for i in range(arr.shape[current_index]):
-                perturbed_arr = recursive_iteration(current_index + 1, dimension_indices + [i], delta)
-        return perturbed_arr
-
-    # Start recursion with an empty list of indices
-    perturbed_arr = recursive_iteration(0, [], delta)
-    return perturbed_arr
+    r_values = [np.random.uniform(0, delta) for i in range(arr.shape[-1])]
+    for i in range(arr.shape[-1]):
+        arr[..., i] = (arr[..., i] + r_values[i]) / (1 + sum(r_values))
+        # normalize again
+    return arr
 
 def perturb_cpts(cpts, delta):
     perturbed_cpts = []
@@ -31,18 +18,16 @@ def perturb_cpts(cpts, delta):
 
 class EMLearner():
     def __init__(self):
-        self.joint_pr = None
-        self.post_pr = None
         self.cpts = None
 
     def get_cpts(self):
         return self.cpts
 
-    def eval_prior_table(self, cpts):
+    def eval_pr_table(self, cpts):
         # The join probability of Sloepnea,Foriennditis,Degar spots, Trimono-ht/s and dunetts syndrom
         f = cpts
         joint_pr = np.zeros(shape=(2, 2, 2, 2, 3))
-        post_pr = np.zeros(shape=(2, 2, 2, 2, 3))
+        norm_joint_pr = np.zeros(shape=(2, 2, 2, 2, 3))
         for dune in range(3):
             for sloe in range(2):
                 for fori in range(2):
@@ -57,20 +42,27 @@ class EMLearner():
                             if (pr > 1) or np.isnan(pr):
                                 raise Exception("Wrong pr: {pr}")
                             joint_pr[sloe, fori, dega, trim, dune] = pr
-                            
-        # Normalize to obtain posterior of the hidden variable: P(dune|sloe, fori, dega, trim)
-        for sloe in range(2):
-            for fori in range(2):
-                for dega in range(2):
-                    for trim in range(2):
-                        post_pr_den = joint_pr[sloe, fori, dega, trim, :].sum()
-                        post_pr[sloe, fori, dega, trim, :] = joint_pr[sloe, fori, dega, trim, :] / post_pr_den if (post_pr_den != 0) else 0
+        
+        norm_joint_pr_den = np.expand_dims(joint_pr.sum(axis=-1), axis=-1)
+        if norm_joint_pr_den.any() == 0:
+            raise Exception("Zero norm_joint_pr_den")
+        norm_joint_pr = joint_pr / norm_joint_pr_den
+        # Replace nans with zeros
+        norm_joint_pr = np.where(np.isnan(norm_joint_pr), 0, norm_joint_pr)
 
-        if (abs(joint_pr.sum() - 1) > 0.1):
-            raise Warning(f"Sum of joint probabilities in the probability table is {joint_pr.sum()}, but it's expected to be equal to 1")             
-        return (joint_pr, post_pr)
+        # Ensure all probabilities are between 0 and 1
+        if not np.all((joint_pr >= 0) & (joint_pr <= 1)):
+            raise ValueError("Invalid probability values in joint_pr.")
+        if not np.all((norm_joint_pr >= 0) & (norm_joint_pr <= 1)):
+            raise ValueError("Invalid probability values in norm_joint_pr.")
 
-    def expectation(self, data):
+        # Ensure the sum of joint probabilities is close to 1
+        if not np.isclose(joint_pr.sum(), 1, atol=0.1):
+            raise Warning(f"Sum of joint probabilities is {joint_pr.sum()}, but expected to be close to 1")
+        
+        return (joint_pr, norm_joint_pr)
+
+    def expectation(self, data, joint_pr, norm_joint_pr):
         missing_count = (data[:, 4] == -1).sum()
         given_count = len(data) - missing_count
         new_data_count = missing_count * 3 + given_count
@@ -82,13 +74,13 @@ class EMLearner():
             # Estimate Dunetts if it's missing
             if example[4] == -1:
                 for dune in range(3):
-                    weighted_example[:3] = example[:3]
+                    weighted_example[:4] = example[:4]
                     weighted_example[4] = dune
                     sloe, fori, dega, trim = example[0:4]
-                    weighted_example[5] = self.joint_pr[int(sloe), int(fori), int(dega), int(trim), int(dune)]
-                    if np.isnan(self.post_pr[int(sloe), int(fori), int(dega), int(trim), int(dune)]):
+                    weighted_example[5] = joint_pr[int(sloe), int(fori), int(dega), int(trim), int(dune)]
+                    if np.isnan(norm_joint_pr[int(sloe), int(fori), int(dega), int(trim), int(dune)]):
                         raise Exception("nan value")
-                    weighted_example[6] = self.post_pr[int(sloe), int(fori), int(dega), int(trim), int(dune)]
+                    weighted_example[6] = norm_joint_pr[int(sloe), int(fori), int(dega), int(trim), int(dune)]
                     weighted_data[idx, :] = weighted_example[:]
                     idx += 1
             else:
@@ -102,28 +94,60 @@ class EMLearner():
         return (weighted_data, sum_joint_pr)
     
     def maximization(self, weighted_data):
-        cpts = []
+        cpts = [None] * 5
 
         # condition structure [sloe, fori, dega, trim, dune]
-        factor_conditions = [
-            [{4: [0, 1, 2]}, {}], # cpt_0
-            [{1: [0, 1]}, {4: [0, 1, 2]}], # cpt_1
-            [{2: [0, 1]}, {4: [0, 1, 2]}], # cpt_2
-            [{3: [0, 1]}, {}], # cpt_3
-            [{0: [0, 1]}, {4: [0, 1, 2], 3: [0, 1]}] # cpt_4
-        ]
+        # The key of each dictionary represents the index of the array to check the condition for
+        # The values represent the value of that array index that need to be counted
+        # The first dictionary is for numerator condition and the second for the denominator condition
+        # factor_conditions = [
+        #     [{4: [0, 1, 2]}, {}], # cpt_0
+        #     [{1: [0, 1]}, {4: [0, 1, 2]}], # cpt_1
+        #     [{2: [0, 1]}, {4: [0, 1, 2]}], # cpt_2
+        #     [{3: [0, 1]}, {}], # cpt_3
+        #     [{0: [0, 1]}, {4: [0, 1, 2], 3: [0, 1]}] # cpt_4
+        # ]
 
-        for factor_condition in factor_conditions:
-            cpt = pseudo_pr(weighted_data, *factor_condition)
-            cpts.append(cpt)
+        cpts[0] = np.array([weighted_data[weighted_data[:, 4] == i, 6].sum() for i in [0, 1, 2]])
+
+        cpts[3] = np.array([weighted_data[weighted_data[:, 3] == i, 6].sum() for i in [0, 1]])
+
+        prior_values = [0, 1, 2]
+        cpt_prior = []
+        for prior_value in prior_values:
+            prior_data = (weighted_data[weighted_data[:, 4] == prior_value, :])
+            cpt_prior.append(np.array([prior_data[prior_data[:, 1] == i, 6].sum() for i in [0, 1]]))
+        cpts[1] = np.array(cpt_prior)
+
+        prior_values = [0, 1, 2]
+        cpt_prior = []
+        for prior_value in prior_values:
+            prior_data = (weighted_data[weighted_data[:, 4] == prior_value, :])
+            cpt_prior.append(np.array([prior_data[prior_data[:, 2] == i, 6].sum() for i in [0, 1]]))
+        cpts[2] = np.array(cpt_prior)
+
+        prior_values_dune = [0, 1, 2]
+        prior_values_trim = [0, 1]
+        cpt_prior_dune = []
+        for prior_value_dune in prior_values_dune:
+            cpt_prior_trim = []
+            prior_data_dune = (weighted_data[weighted_data[:, 4] == prior_value_dune, :])
+            for prior_value_trim in prior_values_trim:
+                prior_data = (prior_data_dune[prior_data_dune[:, 3] == prior_value_trim, :])
+                cpt_prior_trim.append(np.array([prior_data[prior_data[:, 0] == i, 6].sum() for i in [0, 1]]))
+            cpt_prior_dune.append(cpt_prior_trim)
+        cpts[4] = np.array(cpt_prior_dune)
+
+        for cpt in cpts:
+            norm_cpt = np.sum(cpt, axis=-1, keepdims=True)
+            cpt /= norm_cpt
 
         return cpts
 
     def fit(self, train_data: np.array, cpts, criteria=0.01, delta=1):
-        data = train_data
         for iter in range(2000):
-            self.joint_pr, self.post_pr = self.eval_prior_table(cpts)
-            weighted_data, new_sum_joint_pr = self.expectation(data)
+            joint_pr, norm_joint_pr = self.eval_pr_table(cpts)
+            weighted_data, new_sum_joint_pr = self.expectation(train_data, joint_pr, norm_joint_pr)
             cpts = self.maximization(weighted_data)
             if iter > 0:
                 error_rate = abs(new_sum_joint_pr - prev_sum_joint_pr) / prev_sum_joint_pr
@@ -137,9 +161,9 @@ class EMLearner():
         self.cpts = cpts
 
     def predict(self, example: np.array, cpts):
-        _, self.post_pr = self.eval_prior_table(cpts)
+        _, norm_joint_pr = self.eval_pr_table(cpts)
         example_to_int = list(example.astype(int))
-        return np.argmax(self.post_pr[*example_to_int, :])
+        return np.argmax(norm_joint_pr[*example_to_int, :])
 
     def eval_accuracy(self, test_data, cpts):
         success = 0
@@ -150,8 +174,6 @@ class EMLearner():
              if est_value == test_value:
                  success += 1
         return success/test_data.shape[0]
-
-
 
 def read_data(file_name):
     data = np.genfromtxt(file_name)
@@ -168,57 +190,6 @@ def modify_data_type(data):
     modified_data[:, :5] = modified_data[:, :5].astype(np.int16)
 
     return modified_data
-
-def pseudo_pr(data, num_condition: dict, den_condition: dict):
-    # Initialize indices and shape for the numerator
-    data = modify_data_type(data)
-    num_index = next(iter(num_condition))
-    num_values = num_condition[num_index]
-    num_len = len(num_values)
-
-    # Initialize variables for the denominator
-    den_given = bool(den_condition)
-    den_indices = list(den_condition.keys()) if den_given else []
-    den_shape = [len(den_condition[den_index]) for den_index in den_indices] if den_given else []
-
-    # Determine the shape of the CPT based on whether the denominator is given
-    cpt_shape = [*den_shape, num_len] if den_given else [num_len]
-    cpt = np.zeros(shape=cpt_shape)
-
-    def recursive_counter(cpt, indices, shape, den_indices, filtered_data, num_condition, den_condition):
-        if len(indices) == len(shape):
-            # Compute the probability for the current indices
-            num_index = next(iter(num_condition))
-            num_value = num_condition[num_index][indices[-1]]
-            num_data_filtered = filtered_data[(filtered_data[:, num_index] == num_value)]
-
-            # Compute sums for the numerator and denominator
-            num_weight_sum = num_data_filtered[:, 6].sum()
-            den_weight_sum = filtered_data[:, 6].sum() if den_indices else data[:, 6].sum()
-            
-            # Update the CPT
-            cpt[tuple(indices)] = num_weight_sum / den_weight_sum if den_weight_sum != 0 else 0
-        else:
-            # Prepare the filtered data for the next level of recursion
-            next_filtered_data = filtered_data
-            if den_indices and indices:
-                den_index = den_indices[len(indices)-1]
-                den_value = den_condition[den_index][indices[-1]]
-                next_filtered_data = filtered_data[filtered_data[:, den_index].astype(int) == den_value]
-            
-            for index in range(shape[len(indices)]):
-                recursive_counter(cpt, indices + [index], shape, den_indices, next_filtered_data, num_condition, den_condition)
-
-        return cpt
-
-    # Run the recursive counter to compute raw probabilities
-    cpt = recursive_counter(cpt, [], cpt_shape, den_indices, data, num_condition, den_condition)
-
-    # Normalize the last dimension of cpt so that it sums to 1
-    sum_over_last_dim = np.sum(cpt, axis=-1, keepdims=True)
-    cpt = np.divide(cpt, sum_over_last_dim, where=sum_over_last_dim!=0)
-
-    return cpt
 
 def main():
     # P(dune)
@@ -251,7 +222,6 @@ def main():
 
     guess_cpts = [cpt_0, cpt_1, cpt_2, cpt_3, cpt_4]
 
-
     # Read train data
     train_data = read_data('./data/traindata.txt')
     test_data = read_data('./data/testdata.txt')
@@ -261,7 +231,7 @@ def main():
     guess_accuracies = np.zeros(shape=(20, 20))
     em_test_accuracies = np.zeros(shape=(20, 20))
     for delta_idx, delta in enumerate(np.linspace(0, 4, num=20)):
-        print(f"Delta: {delta}")
+        print(f"Delta: {delta:.2f}")
         for trial in range(20):
             print(f"Trial: {trial}")
             deltas[delta_idx] = delta
@@ -270,6 +240,7 @@ def main():
             em_cpts = em_learner.get_cpts()
             guess_accuracies[delta_idx, trial] = em_learner.eval_accuracy(test_data, perturbed_guess_cpts)
             em_test_accuracies[delta_idx, trial] = em_learner.eval_accuracy(test_data, em_cpts)
+        print(f"mean: {em_test_accuracies[delta_idx, :].mean():.2f}, std: {em_test_accuracies[delta_idx, :].std():.2f}")
 
     _, ax = plt.subplots()
     ax.errorbar(deltas, guess_accuracies.mean(axis=1), yerr=guess_accuracies.std(axis=1), label='Guess VS Test Accuracy', alpha=0.5, fmt='-o', lw=0.5)
@@ -281,8 +252,6 @@ def main():
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     plt.show()
-    # for cpt in cpts:
-    #     print(cpt)
 
 if __name__ == '__main__':
     main()
