@@ -1,6 +1,6 @@
 ### Explanation of Code
 
-This code implements an Expectation-Maximization (EM) algorithm for learning conditional probability tables (CPTs) in a Bayesian network model. The Bayesian network represents dependencies between variables in a probabilistic graphical model.
+This code implements an Expectation-Maximization (EM) algorithm for learning conditional probability tables (CPTs) in a Bayesian network model. The Bayesian network represents dependencies between variables in a probabilistic graphical model. The problem is to learn a model that can predict Dunetts Syndrome based on a set of evidence including symptoms or the presence of a gene.
 
 #### Key Functions:
 
